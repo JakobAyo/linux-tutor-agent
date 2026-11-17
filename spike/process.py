@@ -66,18 +66,19 @@ def tokenize(line: str) -> list[str]:
         return line.split()
 
 
-def segments(line: str, aliases: dict[str, str]) -> list[list[str]]:
-    """Split a command line into simple commands, drop wrappers/assignments/redirects, expand aliases."""
-    out, cur = [], []
+def segments(line: str, aliases: dict[str, str]) -> list[tuple[list[str], bool]]:
+    """Split a command line into simple commands, drop wrappers/assignments/redirects, expand aliases.
+    Returns (tokens, piped) where piped means the command reads from a `|` before it."""
+    out, cur, prev_op = [], [], ""
     for tok in tokenize(line) + [";"]:
         if tok in OPERATORS:
             if cur:
-                out.append(cur)
-            cur = []
+                out.append((cur, prev_op in {"|", "|&"}))
+            cur, prev_op = [], tok
         else:
             cur.append(tok)
     result = []
-    for seg in out:
+    for seg, piped in out:
         seg = _strip_redirects(seg)
         expanded_names: set[str] = set()
         for _ in range(6):  # aliases and wrappers can nest a few levels
@@ -85,7 +86,8 @@ def segments(line: str, aliases: dict[str, str]) -> list[list[str]]:
                 seg = seg[1:]
             if seg and seg[0] in aliases and seg[0] not in expanded_names:
                 expanded_names.add(seg[0])  # `ls='ls --color'` must expand only once
-                expanded = tokenize(aliases[seg[0]])
+                # Drop flags the alias adds (`grep --color=auto ...`): teach only what I typed.
+                expanded = [t for i, t in enumerate(tokenize(aliases[seg[0]])) if i == 0 or not t.startswith("-")]
                 if expanded:
                     seg = expanded + seg[1:]
                     continue
@@ -97,7 +99,7 @@ def segments(line: str, aliases: dict[str, str]) -> list[list[str]]:
                 continue
             break
         if seg:
-            result.append(seg)
+            result.append((seg, piped))
     return result
 
 
@@ -120,11 +122,12 @@ def flags_of(seg: list[str]) -> list[str]:
     return [t.split("=", 1)[0] for t in seg[1:] if t.startswith("-") and t not in {"-", "--"}]
 
 
-def single_flags(flags: list[str]) -> list[str]:
-    """'-xeu' -> ['-x', '-e', '-u']; long flags unchanged."""
+def single_flags(flags: list[str], docs: str = "") -> list[str]:
+    """'-xeu' -> ['-x', '-e', '-u']; long flags unchanged. A single-dash word the docs mention
+    as a whole (`find -iname`, `-type`) stays whole."""
     out = []
     for f in flags:
-        if f.startswith("--") or len(f) == 2:
+        if f.startswith("--") or len(f) == 2 or (docs and re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", docs)):
             out.append(f)
         else:
             out += [f"-{c}" for c in f[1:] if c.isalnum()]
@@ -201,7 +204,7 @@ def save_store(store: dict) -> None:
     tmp.replace(STORE)
 
 
-def record(store: dict, seg: list[str], source: str) -> bool:
+def record(store: dict, seg: list[str], source: str, piped: bool = False) -> bool:
     """Count one use. Returns True if the command is new to the store."""
     cmd = seg[0]
     items = store["commands"]
@@ -210,7 +213,8 @@ def record(store: dict, seg: list[str], source: str) -> bool:
         cmd, {"status": "new", "source": source, "count": 0, "flags": {}, "shapes": {}, "card": None}
     )
     item["count"] += 1
-    for f in single_flags(flags_of(seg)):
+    item["piped"] = item.get("piped", 0) + int(piped)
+    for f in flags_of(seg):  # as written; split against the docs only when grounding
         item["flags"][f] = item["flags"].get(f, 0) + 1
     s = shape(seg)
     item["shapes"][s] = item["shapes"].get(s, 0) + 1
@@ -248,10 +252,12 @@ def history_entries(text: str):
         yield "\n".join(entry)
 
 
-def cmd_seed(_args) -> None:
-    store = load_store()
-    if store["commands"]:
-        sys.exit(f"Store already seeded ({len(store['commands'])} commands). Delete {STORE} to reseed.")
+def cmd_seed(args) -> None:
+    old = load_store()["commands"]
+    if old and not args.force:
+        sys.exit(f"Store already seeded ({len(old)} commands). Use `seed --force` to recount "
+                 "(keeps statuses and cards).")
+    store: dict = {"commands": {}}
     aliases = load_aliases()
     n_lines = n_skipped = 0
     for line in history_entries(unmetafy(HISTORY.read_bytes())):
@@ -259,9 +265,14 @@ def cmd_seed(_args) -> None:
         if SECRET.search(line):
             n_skipped += 1
             continue
-        for seg in segments(line, aliases):
+        for seg, piped in segments(line, aliases):
             if countable(seg[0]):
-                record(store, seg, "history")
+                record(store, seg, "history", piped)
+    for cmd, prev in old.items():  # keep what I already did with existing items
+        if cmd in store["commands"]:
+            store["commands"][cmd].update(status=prev["status"], card=prev["card"])
+        else:
+            store["commands"][cmd] = prev  # e.g. a live command not in history
     save_store(store)
     # Start the live log after the seed, so history isn't counted twice.
     OFFSET.write_text(str(LOG.stat().st_size if LOG.exists() else 0))
@@ -308,11 +319,11 @@ def man_excerpt(text: str, flags: list[str]) -> tuple[str, bool]:
     return body[:MAN_CAP], True
 
 
-def grounding(cmd: str, shape_str: str) -> dict:
+def grounding(cmd: str, shape_str: str, used_flags: list[str]) -> dict:
     words = [t for t in shape_str.split()[1:] if WORD.match(t)]
     sub = words[0] if words else None
     man = man_page(cmd, sub)
-    flags = single_flags([t.split("=", 1)[0] for t in shape_str.split()[1:] if t.startswith("-")])
+    flags = single_flags(used_flags, man)  # every flag I've used, so the trimmed man page covers them
     excerpt, trimmed = man_excerpt(man, flags)
     tldr = sh(["tldr", "-m", cmd])
     path = shutil.which(cmd) or ""
@@ -333,8 +344,8 @@ def grounding(cmd: str, shape_str: str) -> dict:
 PROMPT = """You write a short command card for a learner: CS background, little practical Linux.
 They use Arch Linux, zsh, tmux. Skip basics. Explain the why and the concept, not only syntax.
 
-Command they ran (argument values masked as <arg>/<value>):
-    {redacted}
+How they actually use it (argument values masked as <arg>/<value>):
+{usage}
 
 Rules:
 - Use ONLY flags and behaviour present in the local docs below. If unsure, say so.
@@ -345,11 +356,13 @@ Rules:
 # {cmd}  (package: <package or unknown>)
 One sentence: what it does.
 
-## You ran
-`<the command>` then one bullet per flag/subcommand used: what it does.
+## How you use it
+Their most common invocation(s), then one bullet per flag/subcommand they used: what it does.
+If they often pipe into it, say what that means for this command (it reads stdin).
 
 ## Variations
-3-5 bullets: `command` - when you'd use it.
+3-5 bullets: `command` - when you'd use it. Prefer useful flags they have NOT used yet,
+and combinations with other commands (pipes) where that's how the command shines.
 
 ## Concept
 2-4 sentences on the mechanism behind it.
@@ -370,11 +383,20 @@ tldr page:
 
 
 def write_card(cmd: str, item: dict) -> Path | None:
-    top_shape = max(item["shapes"], key=item["shapes"].get) if item["shapes"] else cmd
-    g = grounding(cmd, top_shape)
-    redacted = redact(top_shape, g["all_docs"])
+    shapes = collections.Counter(item["shapes"]).most_common(5) or [(cmd, 1)]
+    top_flags = [f for f, _ in collections.Counter(item["flags"]).most_common(15)]
+    g = grounding(cmd, shapes[0][0], top_flags)
+    docs = g["all_docs"]
+    lines = [f"- `{redact(s, docs)}`  ({n}x)" for s, n in shapes]
+    flags = collections.Counter()
+    for f, n in item["flags"].items():
+        for single in single_flags([f], docs):
+            flags[single] += n
+    if flags:
+        lines.append("- flags used: " + ", ".join(f"{f} ({n}x)" for f, n in flags.most_common(10)))
+    lines.append(f"- used {item['count']}x in total, {item.get('piped', 0)}x with input piped in")
     prompt = PROMPT.format(
-        cmd=cmd, redacted=redacted, whatis=g["whatis"] or "-", package=g["package"] or "unknown",
+        cmd=cmd, usage="\n".join(lines), whatis=g["whatis"] or "-", package=g["package"] or "unknown",
         package_desc=g["package_desc"] or "-", trimmed=" (trimmed to the parts for the flags used)"
         if g["man_trimmed"] else "", man=g["man"] or "(no man page)", tldr=g["tldr"] or "(no tldr page)",
     )
@@ -421,7 +443,7 @@ def invented_flags(card: str, cmd: str, docs: str) -> set[str]:
                 break
             if t.startswith("-") and t not in {"-", "--"}:
                 f = t.split("=", 1)[0]
-                for single in single_flags([f]):
+                for single in single_flags([f], docs):
                     if not re.search(rf"(?<![\w-]){re.escape(single)}(?![\w-])", docs):
                         found.add(single)
     return found
@@ -449,8 +471,8 @@ def cmd_run(args) -> None:
                 continue
             if entry.get("exit") == 127 or SECRET.search(entry.get("command", "")):
                 continue
-            for seg in segments(entry["command"], aliases):
-                if countable(seg[0]) and record(store, seg, "live"):
+            for seg, piped in segments(entry["command"], aliases):
+                if countable(seg[0]) and record(store, seg, "live", piped):
                     live_new.append(seg[0])
         offset += len(complete)
     save_store(store)
@@ -464,7 +486,12 @@ def cmd_run(args) -> None:
     )
     todo += backlog[: args.backlog]
     print(f"{len(live_new)} new command(s) from the log; writing {len(todo)} card(s) "
-          f"({len(backlog)} left in backlog).")
+          f"({max(len(backlog) - args.backlog, 0)} left in backlog).")
+    generate(store, todo)
+
+
+def generate(store: dict, todo: list[str]) -> None:
+    items = store["commands"]
     for cmd in todo:
         print(f"  {cmd} ...", end="", flush=True)
         path = write_card(cmd, items[cmd])
@@ -478,6 +505,22 @@ def cmd_run(args) -> None:
 
 
 # ---------------------------------------------------------------- list / read / mark
+
+
+def cmd_card(args) -> None:
+    """Write (or rewrite) cards for the named commands, regardless of backlog order."""
+    store = load_store()
+    items = store["commands"]
+    todo = []
+    for cmd in args.cmds:
+        if cmd not in items:
+            if not shutil.which(cmd):
+                print(f"  ! {cmd}: not found on PATH, skipped", file=sys.stderr)
+                continue
+            record(store, [cmd], "manual")
+        items[cmd]["status"] = "new"
+        todo.append(cmd)
+    generate(store, todo)
 
 
 def cmd_list(args) -> None:
@@ -524,7 +567,12 @@ def cmd_mark(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="action", required=True)
-    sub.add_parser("seed").set_defaults(func=cmd_seed)
+    s = sub.add_parser("seed")
+    s.add_argument("--force", action="store_true", help="recount from history, keep statuses and cards")
+    s.set_defaults(func=cmd_seed)
+    c = sub.add_parser("card", help="write cards for specific commands now")
+    c.add_argument("cmds", nargs="+")
+    c.set_defaults(func=cmd_card)
     r = sub.add_parser("run")
     r.add_argument("-b", "--backlog", type=int, default=3, help="backlog cards per run (default 3)")
     r.set_defaults(func=cmd_run)

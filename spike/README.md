@@ -16,12 +16,18 @@ Throwaway code for [docs/milestones/m0-spike.md](../docs/milestones/m0-spike.md)
 ```sh
 python3 spike/process.py run          # cards for new commands + top 3 backlog commands
 python3 spike/process.py run -b 0     # only new commands
+python3 spike/process.py card grep find   # cards for specific commands now, skipping the queue
 python3 spike/process.py read         # fzf picker, opens the card, marks it seen
 python3 spike/process.py mark git understood   # or dismissed
 python3 spike/process.py list [new|seen|understood|dismissed]
 ```
 
 Start a command with a space to keep it out of the log.
+
+Every part of a pipeline or chain counts (`journalctl -b | grep -i err` counts `journalctl` and `grep`).
+Alias-added flags (oh-my-zsh's `grep --color=auto ...`) are ignored, so cards cover only what you typed.
+A card is based on your top 5 usage patterns, the flags you've used, and how often you pipe into the command.
+After a parser change, run `seed --force` to recount from history. It keeps statuses and cards.
 
 ## Data
 Everything lives in `~/.local/share/linux-tutor-spike/` (override with `LTUTOR_SPIKE_DIR`):
@@ -38,7 +44,7 @@ These are placeholders, not decisions. The matching `TBD`s in `docs/` stay open 
 | Model per card | Sonnet for every card. |
 | Data directory name | `linux-tutor-spike`, separate from the final name. |
 | Which argument values to keep | Flags are kept. Values become `<arg>`/`<value>`. The first plain word is kept only if the local docs mention it (a subcommand like `git rebase`). |
-| Detection depth | First word only, as the spike plan says. Flag counts are recorded but don't trigger cards. |
+| Detection depth | One card per command, as the spike plan says. Flags are counted and fed into the card, but a new flag doesn't trigger a card of its own. |
 
 ## Known limits
 - Commands inside `$(...)`, `find -exec`, and `xargs` arguments aren't detected.
