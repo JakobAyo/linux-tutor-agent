@@ -21,7 +21,7 @@ A personal tutor that teaches me Linux commands while I work normally on my Arch
 - Public repo: no personal data (history, paths, tokens) in code, tests, fixtures, or docs.
 
 ## Status
-Design phase, no code yet. Decided so far: docs structure, `claude -p` on the subscription, zsh hook observation, public repo with CI/CD (ADRs 0001–0004). Next: the M0 spike (`docs/milestones/m0-spike.md`).
+Design phase, no code yet. Decided so far: docs structure, `claude -p` on the subscription, zsh hook observation, public repo with CI/CD, JSONL log written in `precmd`, secrets dropped in the hook, processor run by hand during the spike, history seeded as a learning backlog (ADRs 0001–0008). Next: the M0 spike (`docs/milestones/m0-spike.md`).
 
 Open questions are marked `**TBD:**` in `docs/`. Before designing or building on a topic, run `grep -rn TBD docs/`, ask me the relevant ones, then record the answer as an ADR. Never fill in a TBD by guessing.
 
