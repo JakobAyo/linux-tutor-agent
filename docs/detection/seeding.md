@@ -11,6 +11,6 @@ Import `~/.zsh_history` (extended format, ~465 distinct first words) into the st
 
 There is no daily cap ([ADR 0012](../decisions/0012-eager-lessons-without-daily-cap.md)), but the backlog is paced per processor run so a fresh seed doesn't fire dozens of calls at once.
 
-**TBD:** How many backlog lessons per processor run? (Spike default: 3. With the 10-minute debounce, that's up to ~18 an hour of active use.)
+Each run writes up to 3 backlog lessons, most used first ([ADR 0015](../decisions/0015-three-backlog-lessons-per-run.md)). That's up to ~18 an hour of active use.
 
 **TBD:** Triage UI for dismissing: a TUI screen, an fzf multi-select, or a plain file I edit?

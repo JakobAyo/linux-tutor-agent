@@ -1,7 +1,7 @@
-# TUI
+# TUI / web UI
 
-A pane (e.g. a tmux split) to browse and read cards: a list of items by status, a card view, keys to change status (`understood`, `dismissed`), regenerate a card.
+A dedicated UI to browse and work through lessons: a list of items by status, a lesson view, keys to change status (`understood`, `dismissed`), regenerate a lesson. Lessons pile up by design ([ADR 0012](../decisions/0012-eager-lessons-without-daily-cap.md)), so this is the main place to read them. Clicking a notification will open it ([ADR 0016](../decisions/0016-notifications-only-no-counter.md)). Until it exists, the spike uses Markdown files and an fzf picker.
 
-**TBD:** Is a TUI needed at all, or are Markdown cards plus fzf enough for the first versions? (The M0 spike writes Markdown only.)
+**TBD:** A terminal UI (TUI) or a local web UI?
 
-**TBD:** Framework: Textual or something else? Key bindings?
+**TBD:** Framework (e.g. Textual for a TUI)? Key bindings?

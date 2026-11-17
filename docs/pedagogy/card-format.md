@@ -25,7 +25,7 @@ Next lesson: --link-dest snapshots, filter rules
 ## Lesson series
 Each command gets a series of lessons ([ADR 0010](../decisions/0010-lesson-series-per-command.md)). Every lesson knows what earlier ones taught and goes one level deeper, e.g. `rsync`: 1 core flags and use cases → 2 `--link-dest` snapshots, filters, over ssh → 3 a backup script on a systemd timer.
 
-**TBD:** When is the next lesson in a series due: after N more uses of the command since the last lesson, after I mark the previous one `understood`, only when I ask, or a mix?
+The next lesson is due after 10 more uses of the command since the last lesson, or right away once I mark the last one `understood` ([ADR 0014](../decisions/0014-next-lesson-after-uses-or-understood.md)).
 
 ## Lesson types
 - **Command lesson:** my usage, the flags I used, flags and modes I'm missing with use cases, combinations with other commands, related or better tools (marked if not installed), the concept, a teaser for the next lesson.
