@@ -1,8 +1,8 @@
 # Caching
 
-Cards are cached so each item costs one LLM call at most.
+Cards are cached so each lesson costs one LLM call at most.
 
-- **Command card:** key = command name.
+- **Command lesson:** key = command name + lesson number ([ADR 0010](../decisions/0010-lesson-series-per-command.md)). The store also keeps a short summary of what each lesson taught, so the next one builds on it.
 - **Flag card:** key = command + flag.
 - **Idiom lesson:** key = idiom id.
 

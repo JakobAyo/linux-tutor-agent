@@ -9,6 +9,8 @@ Import `~/.zsh_history` (extended format, ~465 distinct first words) into the st
 4. Generate cards a few at a time, not all at once. The first-day flood is avoided by pacing, not by marking items as known.
 5. Optional triage: dismiss items I don't care about. Only I set `understood` or `dismissed`.
 
-**TBD:** Pacing: how many backlog cards per processor run or per day, or only when I open an item? (See [llm/usage.md](../llm/usage.md).)
+There is no daily cap ([ADR 0012](../decisions/0012-eager-lessons-without-daily-cap.md)), but the backlog is paced per processor run so a fresh seed doesn't fire dozens of calls at once.
+
+**TBD:** How many backlog lessons per processor run? (Spike default: 3. With the 10-minute debounce, that's up to ~18 an hour of active use.)
 
 **TBD:** Triage UI for dismissing: a TUI screen, an fzf multi-select, or a plain file I edit?

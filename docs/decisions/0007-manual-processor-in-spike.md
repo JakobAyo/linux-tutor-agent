@@ -1,6 +1,6 @@
 # 0007: Run the processor by hand during the M0 spike
 
-- **Status:** Accepted
+- **Status:** Superseded by [0011](0011-activity-debounced-trigger.md)
 - **Date:** 2026-11-17
 
 ## Context
