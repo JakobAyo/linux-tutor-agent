@@ -2,19 +2,28 @@
 """M0 spike processor. Throwaway code: stdlib only, one file.
 
     process.py seed            import ~/.zsh_history as a learning backlog (ADR 0008)
-    process.py run [-b N]      read new log lines, write cards for new commands + top N backlog
-    process.py list            show items by status and use count
-    process.py read            pick a card with fzf, open it in $PAGER, mark it seen
-    process.py mark CMD STATUS set understood / dismissed / new
+    process.py run [-b N]      read new log lines, write due lessons + top N backlog lessons
+    process.py run --auto      same, detached and quiet; started by the zsh hook (ADR 0011)
+    process.py lesson CMD...   write the next lesson for these commands now
+    process.py list            show items by status, lessons, and use count
+    process.py read [--all]    pick a lesson with fzf, open it in $PAGER, mark it seen
+    process.py mark CMD STATUS set understood / dismissed / new / seen
+
+Lessons come in a series per command (ADRs 0009, 0010). Lesson N+1 is due after 10 more uses
+since lesson N, or right away once lesson N is marked understood (ADR 0014). Each run writes
+all new and due lessons plus up to 3 backlog lessons (ADRs 0012, 0015), then sends one
+notification (ADRs 0013, 0016).
 
 Spike-only defaults (not decisions, see spike/README.md): no `--help` calls, man pages
-capped by size, Sonnet for every card, data in ~/.local/share/linux-tutor-spike/.
+capped by size, Sonnet for every lesson, data in ~/.local/share/linux-tutor-spike/.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -29,18 +38,22 @@ DATA = Path(
     os.environ.get("LTUTOR_SPIKE_DIR")
     or Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "linux-tutor-spike"
 )
-LOG, OFFSET, STORE, CARDS, USAGE = (
+LOG, OFFSET, STORE, LESSONS, USAGE = (
     DATA / "cmds.log",
     DATA / "offset",
     DATA / "store.json",
-    DATA / "cards",
+    DATA / "lessons",
     DATA / "usage.jsonl",
 )
+RUN_LOCK, STORE_LOCK = DATA / "run.lock", DATA / "store.lock"
 HISTORY = Path(os.environ.get("HISTFILE", Path.home() / ".zsh_history"))
 
 MODEL = "sonnet"
-MAN_CAP = 30_000  # chars of man page sent to the model
-LIVE_CAP = 10  # max cards for live-new commands per run
+MAN_BUDGET = 60_000  # chars of man pages sent to the model, across the main and subcommand pages
+SUB_PAGE_CAP = 15_000  # per subcommand page (`git-rebase`)
+SUB_PAGES = 3  # subcommand pages per lesson, most used first
+NEXT_AFTER = 10  # uses since the last lesson before the next one is due (ADR 0014)
+BACKLOG_PER_RUN = 3  # ADR 0015
 
 IGNORE = {"cd", "ls", "clear", "exit", "pwd", "echo", "true", "false", "history", "z"}
 WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "nice", "exec", "command", "builtin", "noglob"}
@@ -122,12 +135,16 @@ def flags_of(seg: list[str]) -> list[str]:
     return [t.split("=", 1)[0] for t in seg[1:] if t.startswith("-") and t not in {"-", "--"}]
 
 
+def mentions(docs: str, word: str) -> bool:
+    return bool(re.search(rf"(?<![\w-]){re.escape(word)}(?![\w-])", docs))
+
+
 def single_flags(flags: list[str], docs: str = "") -> list[str]:
     """'-xeu' -> ['-x', '-e', '-u']; long flags unchanged. A single-dash word the docs mention
     as a whole (`find -iname`, `-type`) stays whole."""
     out = []
     for f in flags:
-        if f.startswith("--") or len(f) == 2 or (docs and re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", docs)):
+        if f.startswith("--") or len(f) == 2 or (docs and mentions(docs, f)):
             out.append(f)
         else:
             out += [f"-{c}" for c in f[1:] if c.isalnum()]
@@ -155,7 +172,7 @@ def redact(shape_str: str, docs: str) -> str:
     for t in parts[1:]:
         if t.startswith("-") or t.startswith("<"):
             out.append(t)
-        elif not kept_word and re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", docs):
+        elif not kept_word and mentions(docs, t):
             out.append(t)
             kept_word = True
         else:
@@ -188,13 +205,23 @@ def countable(cmd: str) -> bool:
     return cmd not in IGNORE and "/" not in cmd and shutil.which(cmd) is not None
 
 
-# ---------------------------------------------------------------- store
+# ---------------------------------------------------------------- store and locks
+
+
+def new_item(source: str) -> dict:
+    return {"status": "new", "source": source, "count": 0, "piped": 0, "flags": {}, "shapes": {}, "lessons": []}
 
 
 def load_store() -> dict:
-    if STORE.exists():
-        return json.loads(STORE.read_text())
-    return {"commands": {}}
+    store = json.loads(STORE.read_text()) if STORE.exists() else {"commands": {}}
+    for item in store["commands"].values():
+        # Before the series (ADR 0010) an item had one tldr-style `card`. Keep its path, but it
+        # doesn't count as a lesson: lesson 1 is a discovery lesson.
+        card = item.pop("card", None)
+        if card:
+            item["legacy_card"] = card
+        item.setdefault("lessons", [])
+    return store
 
 
 def save_store(store: dict) -> None:
@@ -204,14 +231,36 @@ def save_store(store: dict) -> None:
     tmp.replace(STORE)
 
 
+@contextlib.contextmanager
+def store_txn():
+    """Short read-modify-write of the store. The background run and manual commands (mark, read)
+    can overlap, so every write reloads the store under this lock first."""
+    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with STORE_LOCK.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        store = load_store()
+        yield store
+        save_store(store)
+
+
+def run_lock():
+    """One processor at a time across all shells (ADR 0011). Returns the open lock file, or None."""
+    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    f = RUN_LOCK.open("w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
 def record(store: dict, seg: list[str], source: str, piped: bool = False) -> bool:
     """Count one use. Returns True if the command is new to the store."""
     cmd = seg[0]
     items = store["commands"]
     new = cmd not in items
-    item = items.setdefault(
-        cmd, {"status": "new", "source": source, "count": 0, "flags": {}, "shapes": {}, "card": None}
-    )
+    item = items.setdefault(cmd, new_item(source))
     item["count"] += 1
     item["piped"] = item.get("piped", 0) + int(piped)
     for f in flags_of(seg):  # as written; split against the docs only when grounding
@@ -252,12 +301,18 @@ def history_entries(text: str):
         yield "\n".join(entry)
 
 
+KEEP_ON_RESEED = ("status", "lessons", "legacy_card", "unverified")
+
+
 def cmd_seed(args) -> None:
+    lock = run_lock()
+    if not lock:
+        sys.exit("A processor run is in progress. Try again in a minute.")
     old = load_store()["commands"]
     if old and not args.force:
         sys.exit(f"Store already seeded ({len(old)} commands). Use `seed --force` to recount "
-                 "(keeps statuses and cards).")
-    store: dict = {"commands": {}}
+                 "(keeps statuses and lessons).")
+    fresh: dict = {"commands": {}}
     aliases = load_aliases()
     n_lines = n_skipped = 0
     for line in history_entries(unmetafy(HISTORY.read_bytes())):
@@ -267,16 +322,17 @@ def cmd_seed(args) -> None:
             continue
         for seg, piped in segments(line, aliases):
             if countable(seg[0]):
-                record(store, seg, "history", piped)
-    for cmd, prev in old.items():  # keep what I already did with existing items
-        if cmd in store["commands"]:
-            store["commands"][cmd].update(status=prev["status"], card=prev["card"])
-        else:
-            store["commands"][cmd] = prev  # e.g. a live command not in history
-    save_store(store)
+                record(fresh, seg, "history", piped)
+    with store_txn() as store:
+        for cmd, prev in store["commands"].items():  # keep what I already did with existing items
+            if cmd in fresh["commands"]:
+                fresh["commands"][cmd].update({k: prev[k] for k in KEEP_ON_RESEED if k in prev})
+            else:
+                fresh["commands"][cmd] = prev  # e.g. a live command not in history
+        store["commands"] = fresh["commands"]
+        items = dict(store["commands"])
     # Start the live log after the seed, so history isn't counted twice.
     OFFSET.write_text(str(LOG.stat().st_size if LOG.exists() else 0))
-    items = store["commands"]
     print(f"Seeded {len(items)} commands from {n_lines} history entries ({n_skipped} secret-looking skipped).")
     print("Backlog, most used first:")
     for cmd, it in sorted(items.items(), key=lambda kv: -kv[1]["count"])[:15]:
@@ -296,18 +352,16 @@ def sh(argv: list[str], timeout: int = 15) -> str:
         return ""
 
 
-def man_page(cmd: str, sub: str | None) -> str:
-    for page in ([f"{cmd}-{sub}"] if sub else []) + [cmd]:
-        text = sh(["man", page])
-        if text:
-            return re.sub(r".\x08", "", text)  # strip overstrike (what `col -b` does)
-    return ""
+def man_page(page: str) -> str:
+    text = sh(["man", page])
+    return re.sub(r".\x08", "", text)  # strip overstrike (what `col -b` does)
 
 
-def man_excerpt(text: str, flags: list[str]) -> tuple[str, bool]:
-    if len(text) <= MAN_CAP:
+def man_excerpt(text: str, flags: list[str], cap: int) -> tuple[str, bool]:
+    """The whole page if it fits, else its head plus the option entries for the flags used."""
+    if len(text) <= cap:
         return text, False
-    head = text[:8_000]
+    head = text[: min(8_000, cap // 3)]
     lines, picked = text.splitlines(), []
     for f in flags:
         pat = re.compile(rf"^\s+(\S+,\s+)*{re.escape(f)}(?![\w-])")
@@ -316,15 +370,42 @@ def man_excerpt(text: str, flags: list[str]) -> tuple[str, bool]:
                 picked.append("\n".join(lines[i : i + 10]))
                 break
     body = head + "\n\n[... trimmed ...]\n\n" + "\n\n".join(picked)
-    return body[:MAN_CAP], True
+    return body[:cap], True
 
 
-def grounding(cmd: str, shape_str: str, used_flags: list[str]) -> dict:
-    words = [t for t in shape_str.split()[1:] if WORD.match(t)]
-    sub = words[0] if words else None
-    man = man_page(cmd, sub)
-    flags = single_flags(used_flags, man)  # every flag I've used, so the trimmed man page covers them
-    excerpt, trimmed = man_excerpt(man, flags)
+def subcommand_candidates(item: dict) -> list[str]:
+    """First plain word of each usage shape, most used first (`git rebase` -> rebase)."""
+    c: collections.Counter = collections.Counter()
+    for s, n in item["shapes"].items():
+        words = [t for t in s.split()[1:] if WORD.match(t)]
+        if words:
+            c[words[0]] += n
+    return [w for w, _ in c.most_common(SUB_PAGES * 2)]
+
+
+def grounding(cmd: str, item: dict, used_flags: list[str]) -> dict:
+    """Local docs for a lesson. Commands with subcommands (`git`, `npm`) get the man pages of the
+    subcommands I use most (`git-rebase`), not just the top-level page."""
+    pages: list[tuple[str, str]] = []
+    for word in subcommand_candidates(item):
+        if len(pages) >= SUB_PAGES:
+            break
+        text = man_page(f"{cmd}-{word}")
+        if text:
+            pages.append((f"{cmd}-{word}", text))
+    main = man_page(cmd)
+    full = main + "\n" + "\n".join(t for _, t in pages)
+    flags = single_flags(used_flags, full)  # every flag I've used, so trimmed pages still cover them
+    parts, trimmed, budget = [], [], MAN_BUDGET
+    for name, text in pages:
+        excerpt, cut = man_excerpt(text, flags, SUB_PAGE_CAP)
+        parts.append(f"man {name}{' (trimmed)' if cut else ''}:\n{excerpt}")
+        trimmed += [name] if cut else []
+        budget -= len(excerpt)
+    if main:
+        excerpt, cut = man_excerpt(main, flags, max(budget, 15_000))
+        parts.insert(0, f"man {cmd}{' (trimmed)' if cut else ''}:\n{excerpt}")
+        trimmed += [cmd] if cut else []
     tldr = sh(["tldr", "-m", cmd])
     path = shutil.which(cmd) or ""
     pkg = sh(["pacman", "-Qqo", path]).strip() if path else ""
@@ -333,74 +414,109 @@ def grounding(cmd: str, shape_str: str, used_flags: list[str]) -> dict:
         m = re.search(r"^Description\s*:\s*(.*)$", sh(["pacman", "-Qi", pkg]), re.M)
         desc = m.group(1) if m else ""
     return {
-        "man": excerpt, "man_trimmed": trimmed, "tldr": tldr, "whatis": sh(["whatis", cmd]).strip(),
-        "package": pkg, "package_desc": desc, "all_docs": man + "\n" + tldr,
+        "man": "\n\n".join(parts), "pages": [cmd] * bool(main) + [n for n, _ in pages], "trimmed": trimmed,
+        "tldr": tldr, "whatis": sh(["whatis", cmd]).strip(), "package": pkg, "package_desc": desc,
+        "all_docs": full + "\n" + tldr,
     }
 
 
-# ---------------------------------------------------------------- cards
+# ---------------------------------------------------------------- lessons
 
 
-PROMPT = """You write a short command card for a learner: CS background, little practical Linux.
-They use Arch Linux, zsh, tmux. Skip basics. Explain the why and the concept, not only syntax.
+PROMPT = """You write lesson {n} in a series that teaches `{cmd}` to one learner.
+Learner: CS background, little practical Linux experience. Arch Linux, zsh + oh-my-zsh, tmux, Hyprland.
+Their goal: become confident in the terminal and write their own scripts and automations.
+Skip basics. Explain the why and the concept, not only syntax.
 
-How they actually use it (argument values masked as <arg>/<value>):
+How they actually use `{cmd}` (argument values masked as <arg>/<value>):
 {usage}
 
+{series}
+
+Teach what they probably don't know yet, anchored to how they use it:
+- flags and modes they haven't used, each with a concrete use case,
+- combinations with other commands (pipes, xargs, find -exec, shell loops, scripts, systemd units/timers),
+- related or better tools in the same area, reached from this command (nothing unrelated),
+- the concept behind it, where it helps.
+{depth}
+
 Rules:
-- Use ONLY flags and behaviour present in the local docs below. If unsure, say so.
-- If the docs are missing or thin, say "local docs: none/limited" instead of guessing.
-- If the command can destroy data or lock you out, add a one-line warning.
-- Output Markdown only, no preamble, max ~35 lines, in this structure:
+- Flags of `{cmd}`: use ONLY flags and behaviour present in the local docs below. If the docs are
+  missing or thin, say "local docs: limited" and stay general instead of guessing.
+- Related tools: name them with at most one example each. Don't teach their flags in detail.
+- If something can destroy data or lock you out, add a one-line warning next to it.
+- Output Markdown only, no preamble, max ~60 lines, in exactly this structure:
 
-# {cmd}  (package: <package or unknown>)
-One sentence: what it does.
+# {cmd} — lesson {n}  (package: <package or unknown>)
 
-## How you use it
-Their most common invocation(s), then one bullet per flag/subcommand they used: what it does.
-If they often pipe into it, say what that means for this command (it reads stdin).
+## You ran
+{you_ran}
 
-## Variations
-3-5 bullets: `command` - when you'd use it. Prefer useful flags they have NOT used yet,
-and combinations with other commands (pipes) where that's how the command shines.
+## What you're missing
+3-5 bullets: `flag` - what it does, and when you'd want it.
+
+## Use cases
+2-4 realistic commands in code spans, each with one line on when to use it.
+
+## Combine it
+1-3 combinations with other commands or a small script/systemd snippet.
+
+## Related tools
+One bullet per tool in exactly this format: - `tool` - why it's related or better.
 
 ## Concept
 2-4 sentences on the mechanism behind it.
 
-## Related
-Related commands, `man` pages, Arch Wiki page title.
+## Next lesson
+One line: what lesson {n_next} will go deeper on.
+
+Then end with exactly one final line, which is stored and shown to the next lesson (not to the learner):
+<!-- taught: short comma-separated list of the flags, tools and ideas this lesson covered -->
 
 --- LOCAL DOCS ---
 whatis: {whatis}
 package: {package} - {package_desc}
 
-man page{trimmed}:
 {man}
 
 tldr page:
 {tldr}
 """
 
+YOU_RAN_FIRST = (
+    "Their most common invocation in a code span, then one short bullet per flag/subcommand they used.\n"
+    "If they often pipe into it, say what that means for this command (it reads stdin)."
+)
+YOU_RAN_LATER = "One or two lines: their most common invocation and how it connects to this lesson's topic."
 
-def write_card(cmd: str, item: dict) -> Path | None:
+
+def series_context(item: dict) -> tuple[str, str]:
+    lessons = item["lessons"]
+    if not lessons:
+        return ("This is lesson 1. Cover their usage, the core flags they're missing, and the main use cases.",
+                "Lesson 1 stays practical: the 80% they'll use weekly.")
+    lines = ["Earlier lessons already taught this. Don't repeat it; build on it:"]
+    lines += [f"- lesson {lsn['n']}: {lsn.get('taught') or '(no summary)'}" for lsn in lessons]
+    if lessons[-1].get("next"):
+        lines.append(f"Lesson {lessons[-1]['n']} promised that the next lesson covers: {lessons[-1]['next']}")
+    return ("\n".join(lines),
+            "Go one level deeper than the earlier lessons: advanced modes, edge cases, scripting, automation.")
+
+
+def usage_lines(cmd: str, item: dict, docs: str) -> str:
     shapes = collections.Counter(item["shapes"]).most_common(5) or [(cmd, 1)]
-    top_flags = [f for f, _ in collections.Counter(item["flags"]).most_common(15)]
-    g = grounding(cmd, shapes[0][0], top_flags)
-    docs = g["all_docs"]
     lines = [f"- `{redact(s, docs)}`  ({n}x)" for s, n in shapes]
-    flags = collections.Counter()
+    flags: collections.Counter = collections.Counter()
     for f, n in item["flags"].items():
         for single in single_flags([f], docs):
             flags[single] += n
     if flags:
         lines.append("- flags used: " + ", ".join(f"{f} ({n}x)" for f, n in flags.most_common(10)))
     lines.append(f"- used {item['count']}x in total, {item.get('piped', 0)}x with input piped in")
-    prompt = PROMPT.format(
-        cmd=cmd, usage="\n".join(lines), whatis=g["whatis"] or "-", package=g["package"] or "unknown",
-        package_desc=g["package_desc"] or "-", trimmed=" (trimmed to the parts for the flags used)"
-        if g["man_trimmed"] else "", man=g["man"] or "(no man page)", tldr=g["tldr"] or "(no tldr page)",
-    )
-    t0 = time.monotonic()
+    return "\n".join(lines)
+
+
+def call_claude(prompt: str) -> tuple[dict | None, str]:
     try:
         r = subprocess.run(
             ["claude", "-p", "--model", MODEL, "--tools", "", "--no-session-persistence",
@@ -408,33 +524,73 @@ def write_card(cmd: str, item: dict) -> Path | None:
             input=prompt, capture_output=True, text=True, timeout=300, cwd=DATA,
         )
         result = json.loads(r.stdout)
-        body = result.get("result", "").strip()
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        print(f"  ! {cmd}: claude -p failed ({e})", file=sys.stderr)
-        return None
+        return None, f"claude -p failed ({e})"
+    body = (result.get("result") or "").strip()
     if r.returncode != 0 or not body or result.get("is_error"):
-        print(f"  ! {cmd}: claude -p error: {body[:200] or r.stderr[:200]}", file=sys.stderr)
+        return None, f"claude -p error: {body[:200] or r.stderr[:200]}"
+    return result, ""
+
+
+def mark_missing_tools(body: str) -> str:
+    """ADR 0009: a suggested tool that isn't installed is marked as such."""
+    out, in_related = [], False
+    for line in body.splitlines():
+        if line.startswith("## "):
+            in_related = line.strip().lower() == "## related tools"
+        m = re.match(r"^\s*[-*]\s+`([\w.+-]+)`", line) if in_related else None
+        if m and not shutil.which(m.group(1)) and "not installed" not in line:
+            line += " *(not installed)*"
+        out.append(line)
+    return "\n".join(out)
+
+
+def write_lesson(cmd: str, item: dict) -> dict | None:
+    """Write the next lesson for `cmd`. Returns the lesson entry for the store, or None."""
+    n = len(item["lessons"]) + 1
+    top_flags = [f for f, _ in collections.Counter(item["flags"]).most_common(15)]
+    g = grounding(cmd, item, top_flags)
+    docs = g["all_docs"]
+    series, depth = series_context(item)
+    prompt = PROMPT.format(
+        cmd=cmd, n=n, n_next=n + 1, usage=usage_lines(cmd, item, docs), series=series, depth=depth,
+        you_ran=YOU_RAN_FIRST if n == 1 else YOU_RAN_LATER, whatis=g["whatis"] or "-",
+        package=g["package"] or "unknown", package_desc=g["package_desc"] or "-",
+        man=g["man"] or "(no man page)", tldr=g["tldr"] or "(no tldr page)",
+    )
+    t0 = time.monotonic()
+    result, err = call_claude(prompt)
+    if not result:
+        print(f"  ! {cmd}: {err}", file=sys.stderr)
         return None
     with USAGE.open("a") as f:
-        f.write(json.dumps({"time": int(time.time()), "cmd": cmd, "model": MODEL,
-                            "seconds": round(time.monotonic() - t0, 1),
-                            "prompt_chars": len(prompt), "cost_usd": result.get("total_cost_usd")}) + "\n")
-    unverified = invented_flags(body, cmd, g["all_docs"])
-    footer = f"\n\n---\n*Grounding: man {'yes' if g['man'] else 'no'}, tldr {'yes' if g['tldr'] else 'no'}"
-    footer += f"{', man trimmed' if g['man_trimmed'] else ''}. Model: {MODEL}.*"
+        f.write(json.dumps({"time": int(time.time()), "cmd": cmd, "lesson": n, "model": MODEL,
+                            "seconds": round(time.monotonic() - t0, 1), "prompt_chars": len(prompt),
+                            "cost_usd": result.get("total_cost_usd")}) + "\n")
+    body = result["result"].strip()
+    m = re.search(r"<!--\s*taught:\s*(.*?)\s*-->", body, re.S)
+    taught = " ".join(m.group(1).split()) if m else ""
+    body = re.sub(r"\s*<!--\s*taught:.*?-->\s*", "\n", body, flags=re.S).strip()
+    m = re.search(r"^## Next lesson\s*\n+(.+)$", body, re.M)
+    nxt = m.group(1).strip() if m else ""
+    body = mark_missing_tools(body)
+    unverified = invented_flags(body, cmd, docs)
+    footer = (f"\n\n---\n*Grounding: man {', '.join(g['pages']) or 'none'}"
+              f"{' (trimmed: ' + ', '.join(g['trimmed']) + ')' if g['trimmed'] else ''}, "
+              f"tldr {'yes' if g['tldr'] else 'no'}. Model: {MODEL}.*")
     if unverified:
         footer += f"\n\n> **Unverified flags** (not found in local docs): {', '.join(sorted(unverified))}"
-    CARDS.mkdir(parents=True, exist_ok=True)
-    path = CARDS / f"{cmd}.md"
+    path = LESSONS / cmd / f"{n}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body + footer + "\n")
-    item["unverified"] = sorted(unverified)
-    return path
+    return {"n": n, "path": str(path), "time": int(time.time()), "taught": taught, "next": nxt,
+            "unverified": sorted(unverified)}
 
 
-def invented_flags(card: str, cmd: str, docs: str) -> set[str]:
-    """Flags used with `cmd` in the card's code spans that the local docs never mention."""
+def invented_flags(lesson: str, cmd: str, docs: str) -> set[str]:
+    """Flags used with `cmd` in the lesson's code spans that the local docs never mention."""
     found = set()
-    for span in re.findall(r"`([^`]+)`", card):
+    for span in re.findall(r"`([^`]+)`", lesson):
         toks = span.split()
         if cmd not in toks:
             continue
@@ -444,26 +600,96 @@ def invented_flags(card: str, cmd: str, docs: str) -> set[str]:
             if t.startswith("-") and t not in {"-", "--"}:
                 f = t.split("=", 1)[0]
                 for single in single_flags([f], docs):
-                    if not re.search(rf"(?<![\w-]){re.escape(single)}(?![\w-])", docs):
+                    if not mentions(docs, single):
                         found.add(single)
     return found
+
+
+def generate(todo: list[str], stop_on_error: bool) -> list[tuple[str, int]]:
+    """Write the next lesson for each command. Returns (command, lesson number) for each one written."""
+    written = []
+    for cmd in todo:
+        item = load_store()["commands"][cmd]
+        print(f"  {cmd} #{len(item['lessons']) + 1} ...", end="", flush=True)
+        lesson = write_lesson(cmd, item)
+        if not lesson:
+            if stop_on_error:  # likely a rate limit or auth problem; the rest stays due for the next run
+                print(" stopping this run.")
+                break
+            continue
+        with store_txn() as store:
+            it = store["commands"][cmd]
+            lesson["count_at"] = it["count"]
+            it["lessons"].append(lesson)
+            it["status"] = "new"
+        warn = f"  (unverified: {', '.join(lesson['unverified'])})" if lesson["unverified"] else ""
+        print(f" {lesson['path']}{warn}")
+        written.append((cmd, lesson["n"]))
+    return written
+
+
+def notify(written: list[tuple[str, int]]) -> None:
+    """One notification per run that wrote lessons, never one per lesson (ADRs 0013, 0016)."""
+    if not written or not shutil.which("notify-send"):
+        return
+    names = ", ".join(c if n == 1 else f"{c} ({n})" for c, n in written)
+    body = f"{len(written)} new lesson{'s' * (len(written) > 1)}: {names}"
+    try:
+        subprocess.run(["notify-send", "--app-name=Linux tutor", "Linux tutor", body],
+                       timeout=10, stdin=subprocess.DEVNULL, capture_output=True)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  ! notify-send failed ({e})", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- run
 
 
+def due_lessons(items: dict, live_new: list[str], backlog_n: int) -> tuple[list[str], int]:
+    """New commands, then due series lessons (ADR 0014), then the top backlog (ADR 0015).
+    Returns the commands to write a lesson for and how many backlog items remain."""
+    todo = [c for c in dict.fromkeys(live_new) if not items[c]["lessons"] and items[c]["status"] != "dismissed"]
+    for c, it in sorted(items.items(), key=lambda kv: -kv[1]["count"]):
+        if it["lessons"] and it["status"] != "dismissed" and (
+            it["status"] == "understood" or it["count"] - it["lessons"][-1]["count_at"] >= NEXT_AFTER
+        ):
+            todo.append(c)
+    backlog = sorted(
+        (c for c, it in items.items() if not it["lessons"] and it["status"] != "dismissed" and c not in todo),
+        key=lambda c: -items[c]["count"],
+    )
+    return todo + backlog[:backlog_n], max(len(backlog) - backlog_n, 0)
+
+
+def detach() -> None:
+    """--auto: leave the shell's session, so `zsh -i` (alias loading) can never be stopped by
+    SIGTTOU/SIGTTIN for touching the terminal from the background."""
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+
+
 def cmd_run(args) -> None:
-    store = load_store()
-    if not store["commands"]:
-        sys.exit("Store is empty. Run `process.py seed` first.")
+    if args.auto:
+        detach()
+    lock = run_lock()
+    if not lock:
+        if not args.auto:
+            print("Another processor run is in progress.")
+        return
+    if not STORE.exists():
+        if not args.auto:
+            sys.exit("Store is empty. Run `process.py seed` first.")
+        return
     offset = int(OFFSET.read_text()) if OFFSET.exists() else 0
-    live_new: list[str] = []
-    if LOG.exists():
-        aliases = load_aliases()
+    data = b""
+    if LOG.exists() and LOG.stat().st_size > offset:
         with LOG.open("rb") as f:
             f.seek(offset)
             data = f.read()
-        complete = data[: data.rfind(b"\n") + 1]  # ignore a half-written last line
+    complete = data[: data.rfind(b"\n") + 1]  # ignore a half-written last line
+    segs: list[tuple[list[str], bool]] = []
+    if complete:
+        aliases = load_aliases()
         for raw in complete.decode("utf-8", "replace").splitlines():
             try:
                 entry = json.loads(raw)
@@ -471,115 +697,121 @@ def cmd_run(args) -> None:
                 continue
             if entry.get("exit") == 127 or SECRET.search(entry.get("command", "")):
                 continue
-            for seg, piped in segments(entry["command"], aliases):
-                if countable(seg[0]) and record(store, seg, "live", piped):
-                    live_new.append(seg[0])
-        offset += len(complete)
-    save_store(store)
-    OFFSET.write_text(str(offset))
-
-    items = store["commands"]
-    todo = [c for c in live_new if not items[c]["card"]][:LIVE_CAP]
-    backlog = sorted(
-        (c for c, it in items.items() if it["status"] == "new" and not it["card"] and c not in todo),
-        key=lambda c: -items[c]["count"],
-    )
-    todo += backlog[: args.backlog]
-    print(f"{len(live_new)} new command(s) from the log; writing {len(todo)} card(s) "
-          f"({max(len(backlog) - args.backlog, 0)} left in backlog).")
-    generate(store, todo)
-
-
-def generate(store: dict, todo: list[str]) -> None:
-    items = store["commands"]
-    for cmd in todo:
-        print(f"  {cmd} ...", end="", flush=True)
-        path = write_card(cmd, items[cmd])
-        if path:
-            items[cmd]["card"] = str(path)
-            warn = f"  (unverified: {', '.join(items[cmd]['unverified'])})" if items[cmd]["unverified"] else ""
-            print(f" {path}{warn}")
-        save_store(store)
-    unread = sum(1 for it in items.values() if it["card"] and it["status"] == "new")
-    print(f"{unread} unread card(s). Read them with: process.py read")
+            segs += [(seg, piped) for seg, piped in segments(entry["command"], aliases) if countable(seg[0])]
+    live_new: list[str] = []
+    with store_txn() as store:
+        for seg, piped in segs:
+            if record(store, seg, "live", piped):
+                live_new.append(seg[0])
+        todo, left = due_lessons(store["commands"], live_new, args.backlog)
+    OFFSET.write_text(str(offset + len(complete)))
+    if not todo:
+        if not args.auto:
+            print(f"{len(segs)} command(s) read from the log. Nothing due.")
+        return
+    print(f"[{time.strftime('%F %T')}] {len(segs)} command(s) read, {len(set(live_new))} new; "
+          f"writing {len(todo)} lesson(s), {left} left in backlog.")
+    written = generate(todo, stop_on_error=True)
+    notify(written)
+    if not args.auto:
+        print("Read them with: process.py read")
 
 
-# ---------------------------------------------------------------- list / read / mark
+# ---------------------------------------------------------------- lesson / list / read / mark
 
 
-def cmd_card(args) -> None:
-    """Write (or rewrite) cards for the named commands, regardless of backlog order."""
-    store = load_store()
-    items = store["commands"]
+def cmd_lesson(args) -> None:
+    """Write the next lesson for the named commands now, regardless of what's due."""
+    lock = run_lock()
+    if not lock:
+        sys.exit("A processor run is in progress. Try again in a minute.")
     todo = []
-    for cmd in args.cmds:
-        if cmd not in items:
-            if not shutil.which(cmd):
-                print(f"  ! {cmd}: not found on PATH, skipped", file=sys.stderr)
-                continue
-            record(store, [cmd], "manual")
-        items[cmd]["status"] = "new"
-        todo.append(cmd)
-    generate(store, todo)
+    with store_txn() as store:
+        items = store["commands"]
+        for cmd in args.cmds:
+            if cmd not in items:
+                if not shutil.which(cmd):
+                    print(f"  ! {cmd}: not found on PATH, skipped", file=sys.stderr)
+                    continue
+                items[cmd] = new_item("manual")
+                items[cmd]["count"] = 1
+                items[cmd]["shapes"] = {cmd: 1}
+            if items[cmd]["status"] == "dismissed":
+                items[cmd]["status"] = "new"
+            todo.append(cmd)
+    generate(todo, stop_on_error=False)
 
 
 def cmd_list(args) -> None:
     items = load_store()["commands"]
+    print(f"{'status':11} {'lessons':>7} {'uses':>5} {'since':>5}  command")
     for cmd, it in sorted(items.items(), key=lambda kv: (kv[1]["status"], -kv[1]["count"])):
         if args.status and it["status"] != args.status:
             continue
-        card = "card" if it["card"] else "    "
-        print(f"{it['status']:11} {card} {it['count']:5}  {cmd}")
+        since = it["count"] - it["lessons"][-1]["count_at"] if it["lessons"] else ""
+        print(f"{it['status']:11} {len(it['lessons']):7} {it['count']:5} {since:>5}  {cmd}")
 
 
-def cmd_read(_args) -> None:
-    store = load_store()
-    items = store["commands"]
-    cards = [c for c, it in items.items() if it["card"] and it["status"] in {"new", "seen"}]
-    if not cards:
-        sys.exit("No cards to read. Run `process.py run` first.")
-    cards.sort(key=lambda c: (items[c]["status"] != "new", -items[c]["count"]))
-    lines = "\n".join(f"{c}\t{items[c]['status']}" for c in cards)
+def cmd_read(args) -> None:
+    items = load_store()["commands"]
+    rows = []
+    for cmd, it in items.items():
+        if not it["lessons"] or (not args.all and it["status"] not in {"new", "seen"}):
+            continue
+        for lsn in reversed(it["lessons"] if args.all else it["lessons"][-1:]):
+            latest = lsn is it["lessons"][-1]
+            rows.append((not (latest and it["status"] == "new"), -it["count"], -lsn["n"],
+                         f"{cmd}\t#{lsn['n']}\t{it['status'] if latest else 'older'}\t{lsn['path']}"))
+    if not rows:
+        sys.exit("No lessons to read. They're written in the background, or run `process.py run`.")
+    lines = "\n".join(r[-1] for r in sorted(rows))
     pick = subprocess.run(
-        ["fzf", "--delimiter", "\t", "--with-nth", "1,2", "--preview", f"cat {CARDS}/{{1}}.md"],
-        input=lines, capture_output=False, stdout=subprocess.PIPE, text=True,
+        ["fzf", "--delimiter", "\t", "--with-nth", "1,2,3", "--preview", "cat {4}"],
+        input=lines, stdout=subprocess.PIPE, text=True,
     ).stdout.strip()
     if not pick:
         return
-    cmd = pick.split("\t")[0]
+    cmd, num, _status, path = pick.split("\t")
     pager = os.environ.get("PAGER", "less")
-    subprocess.run([*shlex.split(pager), items[cmd]["card"]])
-    if items[cmd]["status"] == "new":
-        items[cmd]["status"] = "seen"
-        save_store(store)
-    print(f"{cmd}: mark with `process.py mark {cmd} understood` (or dismissed).")
+    subprocess.run([*shlex.split(pager), path])
+    with store_txn() as store:
+        it = store["commands"][cmd]
+        if it["status"] == "new" and int(num[1:]) == len(it["lessons"]):
+            it["status"] = "seen"
+    print(f"{cmd}: `process.py mark {cmd} understood` writes the next lesson in the next run "
+          "(or `dismissed` to stop the series).")
 
 
 def cmd_mark(args) -> None:
-    store = load_store()
-    if args.cmd not in store["commands"]:
-        sys.exit(f"Unknown command: {args.cmd}")
-    store["commands"][args.cmd]["status"] = args.status
-    save_store(store)
-    print(f"{args.cmd}: {args.status}")
+    with store_txn() as store:
+        if args.cmd not in store["commands"]:
+            sys.exit(f"Unknown command: {args.cmd}")
+        store["commands"][args.cmd]["status"] = args.status
+    hint = {"understood": " Its next lesson is due in the next run.",
+            "dismissed": " No more lessons for it."}.get(args.status, "")
+    print(f"{args.cmd}: {args.status}.{hint}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="action", required=True)
     s = sub.add_parser("seed")
-    s.add_argument("--force", action="store_true", help="recount from history, keep statuses and cards")
+    s.add_argument("--force", action="store_true", help="recount from history, keep statuses and lessons")
     s.set_defaults(func=cmd_seed)
-    c = sub.add_parser("card", help="write cards for specific commands now")
+    c = sub.add_parser("lesson", aliases=["card"], help="write the next lesson for specific commands now")
     c.add_argument("cmds", nargs="+")
-    c.set_defaults(func=cmd_card)
+    c.set_defaults(func=cmd_lesson)
     r = sub.add_parser("run")
-    r.add_argument("-b", "--backlog", type=int, default=3, help="backlog cards per run (default 3)")
+    r.add_argument("-b", "--backlog", type=int, default=BACKLOG_PER_RUN,
+                   help=f"backlog lessons per run (default {BACKLOG_PER_RUN})")
+    r.add_argument("--auto", action="store_true", help="detached and quiet; used by the zsh hook")
     r.set_defaults(func=cmd_run)
     ls = sub.add_parser("list")
     ls.add_argument("status", nargs="?", choices=["new", "seen", "understood", "dismissed"])
     ls.set_defaults(func=cmd_list)
-    sub.add_parser("read").set_defaults(func=cmd_read)
+    rd = sub.add_parser("read")
+    rd.add_argument("--all", action="store_true", help="include older lessons and understood/dismissed commands")
+    rd.set_defaults(func=cmd_read)
     m = sub.add_parser("mark")
     m.add_argument("cmd")
     m.add_argument("status", choices=["new", "seen", "understood", "dismissed"])

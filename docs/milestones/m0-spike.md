@@ -24,7 +24,7 @@ Find out whether automatic discovery lessons are worth building, then use them f
 - Is a series per command useful, and when should the next lesson come?
 
 ## Findings so far
-- Commands with subcommands (`git`, `pacman`, `systemctl`, `npm`) were grounded in only one man page, so flags from other subcommands showed up as "unverified" and were explained from memory.
+- Commands with subcommands (`git`, `pacman`, `systemctl`, `npm`) were grounded in only one man page, so flags from other subcommands showed up as "unverified" and were explained from memory. The spike now sends up to 3 subcommand pages (`git-rebase`), most used first. Still to check: whether that removes most "unverified" flags.
 
 ## Results
 TBD (after the spike week).
