@@ -628,15 +628,24 @@ def generate(todo: list[str], stop_on_error: bool) -> list[tuple[str, int]]:
     return written
 
 
+# Waits for the click, then opens the reader in a new kitty window (ADR 0023).
+CLICK_TO_OPEN = 'test "$(notify-send --wait --action=default=Open "$@")" = default && exec kitty --class shtutor shtutor'
+
+
 def notify(written: list[tuple[str, int]]) -> None:
     """One notification per run that wrote lessons, never one per lesson (ADRs 0013, 0016)."""
     if not written or not shutil.which("notify-send"):
         return
     names = ", ".join(c if n == 1 else f"{c} ({n})" for c, n in written)
     body = f"{len(written)} new lesson{'s' * (len(written) > 1)}: {names}"
+    args = ["--app-name=Linux tutor", "Linux tutor", body]
     try:
-        subprocess.run(["notify-send", "--app-name=Linux tutor", "Linux tutor", body],
-                       timeout=10, stdin=subprocess.DEVNULL, capture_output=True)
+        if shutil.which("shtutor") and shutil.which("kitty"):
+            # A detached child waits for the click, so this run exits and releases its locks now.
+            subprocess.Popen(["sh", "-c", CLICK_TO_OPEN, "sh", *args], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["notify-send", *args], timeout=10, stdin=subprocess.DEVNULL, capture_output=True)
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"  ! notify-send failed ({e})", file=sys.stderr)
 

@@ -18,12 +18,15 @@ That's it. The hook starts the processor in the background, so lessons appear on
 - `precmd` starts `process.py run --auto` disowned, at most every 10 minutes per shell, and on the first prompt of a new shell ([ADR 0011](../docs/decisions/0011-activity-debounced-trigger.md)). A lock file keeps it to one run at a time across shells.
 - Each run writes lesson 1 for every new command, the next lesson for every command that's due, and up to 3 lessons from the history backlog, most used first ([ADRs 0012](../docs/decisions/0012-eager-lessons-without-daily-cap.md), [0015](../docs/decisions/0015-three-backlog-lessons-per-run.md)).
 - The next lesson for a command is due after 10 more uses, or right away once you mark it `understood` ([ADR 0014](../docs/decisions/0014-next-lesson-after-uses-or-understood.md)).
-- A run that wrote lessons sends one notification, e.g. "3 new lessons: rsync, find, git (2)" ([ADR 0013](../docs/decisions/0013-notify-when-lessons-are-ready.md)).
+- A run that wrote lessons sends one notification, e.g. "3 new lessons: rsync, find, git (2)" ([ADR 0013](../docs/decisions/0013-notify-when-lessons-are-ready.md)). Clicking it opens `shtutor` in a new kitty window, if both are on `PATH` ([ADR 0023](../docs/decisions/0023-notification-click-opens-kitty.md)).
 - If `claude -p` fails (rate limit, auth), the run stops and the rest stays due for the next run. Check `run.log`.
 
 Set `LTUTOR_SPIKE_AUTO=0` before sourcing the hook to only log, or `LTUTOR_SPIKE_INTERVAL=<seconds>` to change the debounce.
 
 ## Daily use
+Read lessons with `shtutor` from anywhere, or click the notification ([milestones/m1-reader.md](../docs/milestones/m1-reader.md)). Install it once from the repo root with `uv tool install --editable .`.
+
+The old commands still work:
 ```sh
 python3 spike/process.py read         # fzf picker, opens the latest lesson, marks it seen
 python3 spike/process.py read --all   # also older lessons in a series
