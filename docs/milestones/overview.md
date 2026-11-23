@@ -2,7 +2,10 @@
 
 | Milestone | Goal | Status |
 |---|---|---|
-| [M0 spike](m0-spike.md) | One evening: hook + Markdown card per new command; use it for a week | Planned |
-| M1+ | Defined after the M0 spike results | TBD |
+| [M0 spike](m0-spike.md) | Hook + automatic discovery lessons; use it for a week | Done |
+| [M1 reader](m1-reader.md) | `shtutor`: a TUI to read lessons, opened from anywhere and from the notification | In progress |
+| M2+ | Defined after M1 | TBD |
 
-**TBD:** Milestones after M0. Proposed shape: M1 foundation (package, store, runner, CI) → M2 observation and parsing → M3 detection and seeding → M4 cards and grounding → M5 UI (counter, TUI or widgets) → M6 daily use. Confirm or reorder after the spike.
+M1 is the reader app, built before the foundation, because the spike showed that reading is the bottleneck ([ADR 0019](../decisions/0019-reader-app-first.md)).
+
+**TBD:** Milestones after M1. Remaining shape from the original proposal: foundation (port the processor, store, runner, CI) → observation and parsing → detection and seeding → lessons and grounding → widgets → daily use. Confirm or reorder after M1.

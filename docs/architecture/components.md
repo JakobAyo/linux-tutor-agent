@@ -16,4 +16,6 @@ One responsibility each. Names are provisional until the package layout is decid
 | ui | Counter, TUI, zle widgets, CLI |
 | installer | Add/remove the hook in `.zshrc`, background units |
 
-**TBD:** Language and package layout. (Leaning: Python 3.12+ with uv, see [tech-stack.md](tech-stack.md).)
+Language: Python 3.12+ with uv ([ADR 0020](../decisions/0020-python-with-uv.md)).
+
+**TBD:** Package layout (module per component, or grouped)?
