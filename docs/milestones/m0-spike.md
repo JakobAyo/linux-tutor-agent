@@ -1,6 +1,6 @@
 # M0: Spike
 
-Status: In progress.
+Status: Done (2026-11-23).
 
 ## Goal
 Find out whether automatic discovery lessons are worth building, then use them for a week.
@@ -15,8 +15,8 @@ Find out whether automatic discovery lessons are worth building, then use them f
 
 ## Done when
 - [x] Hook installed and logging without noticeable delay.
-- [ ] Lessons generated automatically in the background, with no invented flags in a manual check of 10 lessons.
-- [ ] Used for a week; results written below.
+- [x] Lessons generated automatically in the background. The manual check of 10 lessons for invented flags was skipped. Invented flags get reported as bugs when I notice them ([ADR 0018](../decisions/0018-close-m0-without-manual-flag-check.md)).
+- [x] Used for a week; results written below.
 
 ## Questions the spike should answer
 - Do I actually read the lessons when notified?
@@ -27,4 +27,11 @@ Find out whether automatic discovery lessons are worth building, then use them f
 - Commands with subcommands (`git`, `pacman`, `systemctl`, `npm`) were grounded in only one man page, so flags from other subcommands showed up as "unverified" and were explained from memory. The spike now sends up to 3 subcommand pages (`git-rebase`), most used first. Still to check: whether that removes most "unverified" flags.
 
 ## Results
-TBD (after the spike week).
+Week of 2026-11-17 to 2026-11-23: 447 commands logged, 104 lessons for 99 commands, about $4 in total.
+
+- **Do I read the lessons when notified?** No. I opened 5 of 99. Clicking the notification did nothing, and reading meant going to the repo and running `python3 spike/process.py read`. Reading, not writing, is the bottleneck.
+- **Do they teach me something new, at this length?** Yes. The ones I read taught me something, and the length was right.
+- **Is a series per command useful?** Not enough data yet. Almost no command reached lesson 2.
+- **Grounding:** 37 of 104 lessons carry an "Unverified flags" note. Not checked by hand ([ADR 0018](../decisions/0018-close-m0-without-manual-flag-check.md)).
+
+Next: M1 builds the reader app so lessons can be opened from anywhere and from the notification ([ADR 0019](../decisions/0019-reader-app-first.md)).

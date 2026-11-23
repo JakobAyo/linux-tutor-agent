@@ -23,12 +23,15 @@ A personal tutor that teaches me Linux while I work normally on my Arch machine.
 - Public repo: no personal data (history, paths, tokens) in code, tests, fixtures, or docs.
 
 ## Status
-M0 spike in progress (`spike/`, `docs/milestones/m0-spike.md`). Decided so far: docs structure, `claude -p` on the subscription, zsh hook observation, public repo with CI/CD, JSONL log written in `precmd`, secrets dropped in the hook, history seeded as a learning backlog (ADRs 0001–0008), discovery lessons in a series per command, an activity-debounced background trigger, eager lessons with no daily cap, one notification per run (ADRs 0009–0013), next lesson after 10 more uses or `understood`, 3 backlog lessons per run, notifications only with no counter (ADRs 0014–0016), `develop` + `main` branch model (ADR 0017).
+M0 spike done (`spike/`, `docs/milestones/m0-spike.md`): lessons are good, but I only opened 5 of 99, so reading is the bottleneck. Next is M1, the reader app (`docs/milestones/m1-reader.md`): a `shtutor` command with a Textual TUI that opens from anywhere and from the notification, on top of the spike's data. Decided so far: docs structure, `claude -p` on the subscription, zsh hook observation, public repo with CI/CD, JSONL log written in `precmd`, secrets dropped in the hook, history seeded as a learning backlog (ADRs 0001–0008), discovery lessons in a series per command, an activity-debounced background trigger, eager lessons with no daily cap, one notification per run (ADRs 0009–0013), next lesson after 10 more uses or `understood`, 3 backlog lessons per run, notifications only with no counter (ADRs 0014–0016), `develop` + `main` branch model (ADR 0017), M0 closed without the manual flag check, reader app first, Python with uv, a Textual TUI, command name `shtutor` (ADRs 0018–0022).
 
 Open questions are marked `**TBD:**` in `docs/`. Before designing or building on a topic, run `grep -rn TBD docs/`, ask me the relevant ones, then record the answer as an ADR. Never fill in a TBD by guessing.
 
 ## Commands
-None yet.
+- `uv sync`: set up `.venv` with dev dependencies.
+- `uv run pytest`: run the tests.
+- `uv tool install --editable .`: put `shtutor` on `PATH` (source edits apply at once).
+- `shtutor`: open the lesson reader.
 
 ## Docs
 Project decisions and design notes live in `docs/`. Start at `docs/CLAUDE.md` (index).
